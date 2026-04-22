@@ -10,7 +10,7 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler, filters
 )
 
-import pirate
+import torrent_handler
 import photo_handler
 
 load_dotenv()
@@ -129,7 +129,17 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Increased global timeouts for handling large file transfers
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(60)
+        .pool_timeout(60)
+        .build()
+    )
 
     # Pass db dependencies to the external handlers
     torrent_handler.setup_db(cursor, conn, GROUP_ID, get_or_create_topic)
