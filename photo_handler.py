@@ -3,6 +3,7 @@ import uuid
 import zipfile
 import shutil
 import asyncio
+import sqlite3
 from PIL import Image, ImageDraw, ImageFont
 import torch
 import torchvision.models as models
@@ -11,6 +12,7 @@ from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 # Init MobileNetV2 for feature extraction
@@ -64,8 +66,9 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 image_paths.append(path)
                 features.append(extract_features(path))
                 
-    if not image_paths:
-        await msg.edit_text("❌ No valid images found in the zip.")
+    # CRITICAL FIX: AgglomerativeClustering requires at least 2 images
+    if len(image_paths) < 2:
+        await msg.edit_text("❌ Please upload a ZIP containing at least 2 images to run clustering.")
         shutil.rmtree(work_dir, ignore_errors=True)
         return
 
@@ -117,17 +120,29 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # Draw label in cyan text against the black background for high contrast
         draw.text((x + 10, y + thumb_size + 10), class_name, fill="#00FFFF", font=font) 
         
-        # Create a specific bundle ID just for this class
-        class_bundle_id = f"{bundle_id}_{label_id}"
+        # Use hyphens instead of underscores to prevent Telegram formatting issues
+        class_bundle_id = f"{bundle_id}-{label_id}"
         
         # Upload all images in this class to the supergroup in the background
         for img_path in paths:
             with open(img_path, 'rb') as f:
-                sent = await context.bot.send_photo(chat_id=group_id, message_thread_id=topic_id, photo=f)
+                # CRITICAL FIX: Increased timeouts for large file uploads
+                sent = await context.bot.send_photo(
+                    chat_id=group_id, 
+                    message_thread_id=topic_id, 
+                    photo=f,
+                    read_timeout=60,
+                    write_timeout=60,
+                    connect_timeout=60
+                )
                 uid = str(uuid.uuid4())[:8]
                 cursor.execute('''INSERT INTO files (uid, file_id, file_unique_id, file_type, file_name, owner_id, bundle_id) 
                                   VALUES (?, ?, ?, ?, ?, ?, ?)''', 
                                   (uid, sent.photo[-1].file_id, sent.photo[-1].file_unique_id, "photo", class_name, user.id, class_bundle_id))
+                
+                # Prevent Telegram API FloodWait errors
+                await asyncio.sleep(0.3) 
+                
         conn.commit()
         
         keyboard.append([InlineKeyboardButton(f"📥 Get {class_name} ({len(paths)} imgs)", callback_data=f"cluster_{class_bundle_id}")])
@@ -152,7 +167,36 @@ async def photo_cluster_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
+    # Get the class_bundle_id from the button data
     class_bundle_id = query.data.split('cluster_')[1]
-    link = f"https://t.me/{context.bot.username}?start={class_bundle_id}"
     
-    await query.message.reply_text(f"🔗 Retrieve this entire class of images via your private link:\n{link}")
+    # Temporarily connect to the DB locally just for this callback to retrieve the files
+    conn = sqlite3.connect('filestore_v2.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM files WHERE bundle_id = ?', (class_bundle_id,))
+    files_data = cursor.fetchall()
+    
+    if not files_data:
+        await query.message.reply_text("❌ Could not locate these files in your cloud.")
+        conn.close()
+        return
+        
+    class_name = files_data[0]['file_name']
+    
+    # Send the Header
+    await query.message.reply_text(f"📁 **{class_name}** ⬇️", parse_mode=ParseMode.MARKDOWN)
+    
+    # Send all photos directly to the chat
+    for file_data in files_data:
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id, 
+                photo=file_data['file_id']
+            )
+            await asyncio.sleep(0.3) # Prevent API limits when sending back many photos
+        except Exception as e:
+            print(f"Failed to send a photo: {e}")
+            
+    conn.close()
